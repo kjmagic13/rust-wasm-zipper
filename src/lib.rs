@@ -34,11 +34,23 @@ extern "C" {
     #[wasm_bindgen(typescript_type = "{ name: string; source: ZipSource }")]
     pub type ZipInput;
 
-    #[wasm_bindgen(method, getter)]
-    fn name(this: &ZipInput) -> String;
+    #[wasm_bindgen(method, getter, catch)]
+    fn name(this: &ZipInput) -> Result<JsValue, JsValue>;
 
-    #[wasm_bindgen(method, getter)]
-    fn source(this: &ZipInput) -> JsValue;
+    #[wasm_bindgen(method, getter, catch)]
+    fn source(this: &ZipInput) -> Result<JsValue, JsValue>;
+}
+
+// Catching versions of the web-sys calls `to_stream` needs. The web-sys bindings don't
+// catch, so an object that passes `instanceof` without being the real thing (say,
+// `Object.create(Blob.prototype)`) would throw straight through the wasm executor.
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(catch, js_namespace = ["Blob", "prototype", "stream"], js_name = call)]
+    fn blob_stream(blob: &Blob) -> Result<web_sys::ReadableStream, JsValue>;
+
+    #[wasm_bindgen(catch, js_namespace = ["FileSystemFileHandle", "prototype", "getFile"], js_name = call)]
+    fn get_file(handle: &FileSystemFileHandle) -> Result<js_sys::Promise, JsValue>;
 }
 
 /// Resolves any supported source into a `ReadableStream` of its bytes.
@@ -52,23 +64,25 @@ async fn to_stream(source: JsValue) -> Result<web_sys::ReadableStream, JsValue> 
     }
     // `File` is a `Blob`, so this covers `<input type="file">` picks too.
     if source.is_instance_of::<Blob>() {
-        return Ok(source.unchecked_ref::<Blob>().stream());
+        return blob_stream(source.unchecked_ref());
     }
     if source.is_instance_of::<Response>() {
-        return source
-            .unchecked_ref::<Response>()
-            .body()
-            .ok_or_else(|| JsValue::from_str("response has no body"));
+        // `Reflect.get` catches a throwing `body` getter.
+        let body = js_sys::Reflect::get(&source, &JsValue::from_str("body"))?;
+        if body.is_null() {
+            return Err(JsValue::from_str("response has no body"));
+        }
+        return Ok(body.unchecked_into());
     }
     if source.is_instance_of::<FileSystemFileHandle>() {
-        let file: File = JsFuture::from(source.unchecked_ref::<FileSystemFileHandle>().get_file())
+        let file: File = JsFuture::from(get_file(source.unchecked_ref())?)
             .await?
             .unchecked_into();
-        return Ok(file.stream());
+        return blob_stream(&file);
     }
     // Buffers are wrapped in a `Blob` rather than copied into a hand-built stream.
     if source.is_instance_of::<ArrayBuffer>() || ArrayBuffer::is_view(&source) {
-        return Ok(Blob::new_with_u8_array_sequence(&Array::of1(&source))?.stream());
+        return blob_stream(&Blob::new_with_u8_array_sequence(&Array::of1(&source))?);
     }
     Err(JsValue::from_str(
         "unsupported source: expected a ReadableStream, Blob/File, Response, \
@@ -77,6 +91,9 @@ async fn to_stream(source: JsValue) -> Result<web_sys::ReadableStream, JsValue> 
 }
 
 /// Returns a `ReadableStream` of the ZIP archive's bytes.
+///
+/// Problems with the inputs (bad names, unsupported or locked sources, sources that
+/// throw) error the returned stream rather than throwing here.
 #[wasm_bindgen]
 pub fn zip_files(files: Vec<ZipInput>) -> web_sys::ReadableStream {
     // Capacity 1 gives backpressure: the writer waits until the reader pulls.
@@ -97,11 +114,18 @@ async fn write_zip(out: &mut Output, files: Vec<ZipInput>) -> Result<(), JsValue
     let mut entries = Vec::with_capacity(files.len());
 
     for input in files {
-        let mut entry = Entry::new(input.name(), out.offset)?;
+        let name = input
+            .name()?
+            .as_string()
+            .ok_or_else(|| JsValue::from_str("entry name must be a string"))?;
+        let mut entry = Entry::new(name, out.offset)?;
         out.write(entry.local_header()).await?;
 
-        let source = to_stream(input.source()).await?;
-        let mut chunks = ReadableStream::from_raw(source).into_stream();
+        let source = to_stream(input.source()?).await?;
+        // `into_stream` panics on a locked stream, which would abort the wasm instance.
+        let mut chunks = ReadableStream::from_raw(source)
+            .try_into_stream()
+            .map_err(|(err, _)| JsValue::from(err))?;
         let mut crc = Hasher::new();
         let mut size = 0u64;
 
