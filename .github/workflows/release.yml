@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      - name: Build
+        run: wasm-pack build --target web --release
+
+      - name: Prepare package
+        working-directory: pkg
+        run: |
+          # wasm-pack writes a `*` in .gitignore
+          rm -f .gitignore
+          # Keep package.json version in sync with the tag (strip leading "v")
+          npm pkg set version="${GITHUB_REF_NAME#v}"
+          npm pack
+          mv ./*.tgz "../${{ github.event.repository.name }}-${GITHUB_REF_NAME}.tgz"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "${{ github.event.repository.name }}-${GITHUB_REF_NAME}.tgz" \
+            --title "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --generate-notes
